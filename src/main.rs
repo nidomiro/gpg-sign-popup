@@ -60,13 +60,26 @@ fn local_timestamp() -> String {
 // -------------------------------------------------------------------- logging
 
 struct ProxyLogger {
-    log_file: Mutex<File>,
+    log_file: Option<Mutex<File>>,
     started_at: Instant,
     process_id: u32,
 }
 
 impl ProxyLogger {
-    fn new(log_path: &Path) -> std::io::Result<Self> {
+    fn new(log_path: Option<&Path>) -> std::io::Result<Self> {
+        let log_file = match log_path {
+            Some(log_path) => Some(Mutex::new(Self::open_log_file(log_path)?)),
+            None => None,
+        };
+
+        Ok(Self {
+            log_file,
+            started_at: Instant::now(),
+            process_id: std::process::id(),
+        })
+    }
+
+    fn open_log_file(log_path: &Path) -> std::io::Result<File> {
         if let Some(parent_directory) = log_path.parent() {
             create_dir_all(parent_directory)?;
         }
@@ -81,15 +94,14 @@ impl ProxyLogger {
 
         // .mode() only applies on creation; narrow a pre-existing file too.
         log_file.set_permissions(Permissions::from_mode(0o600))?;
-
-        Ok(Self {
-            log_file: Mutex::new(log_file),
-            started_at: Instant::now(),
-            process_id: std::process::id(),
-        })
+        Ok(log_file)
     }
 
     fn log(&self, direction: &str, message: &str) {
+        let Some(log_file) = &self.log_file else {
+            return;
+        };
+
         let elapsed_milliseconds = self.started_at.elapsed().as_millis();
         let log_line = format!(
             "{} [{}] +{:>8}ms {} {}\n",
@@ -100,28 +112,41 @@ impl ProxyLogger {
             message
         );
 
-        if let Ok(mut log_file) = self.log_file.lock() {
+        if let Ok(mut log_file) = log_file.lock() {
             let _ = log_file.write_all(log_line.as_bytes());
             let _ = log_file.flush();
         }
     }
+
+    /// Reports an unrecoverable error (log, and stderr so gpg-agent's own log
+    /// shows it even when file logging is off) and exits.
+    fn fatal(&self, message: &str) -> ! {
+        self.log(DIRECTION_META, message);
+        eprintln!("scdaemon-touch-proxy: {}", message);
+        std::process::exit(2);
+    }
 }
 
-fn default_log_path() -> PathBuf {
-    if let Ok(configured_path) = env::var("SCDAEMON_TOUCH_PROXY_LOG") {
-        return PathBuf::from(configured_path);
+/// Logging is off unless `SCDAEMON_TOUCH_PROXY_LOG` is set: `1` selects the
+/// default location, any other value (except empty/`0`) is used as the path.
+fn configured_log_path() -> Option<PathBuf> {
+    let configured = env::var("SCDAEMON_TOUCH_PROXY_LOG").ok()?;
+    match configured.as_str() {
+        "" | "0" => return None,
+        "1" => {}
+        path => return Some(PathBuf::from(path)),
     }
 
     let home_directory = PathBuf::from(env::var("HOME").unwrap_or_else(|_| String::from("/tmp")));
 
-    if cfg!(target_os = "macos") {
+    Some(if cfg!(target_os = "macos") {
         home_directory.join("Library/Logs/scdaemon-touch-proxy.log")
     } else {
         let state_directory = env::var("XDG_STATE_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| home_directory.join(".local/state"));
         state_directory.join("scdaemon-touch-proxy/session.log")
-    }
+    })
 }
 
 // ------------------------------------------------------------ target discovery
@@ -139,17 +164,8 @@ fn resolve_real_scdaemon(logger: &ProxyLogger) -> PathBuf {
         .output()
     {
         Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            logger.log(
-                DIRECTION_META,
-                &format!("gpgconf failed: {}", output.status),
-            );
-            std::process::exit(2);
-        }
-        Err(error) => {
-            logger.log(DIRECTION_META, &format!("gpgconf not runnable: {}", error));
-            std::process::exit(2);
-        }
+        Ok(output) => logger.fatal(&format!("gpgconf failed: {}", output.status)),
+        Err(error) => logger.fatal(&format!("gpgconf not runnable: {}", error)),
     };
 
     let libexec_directory = String::from_utf8_lossy(&libexec_output.stdout)
@@ -162,31 +178,19 @@ fn resolve_real_scdaemon(logger: &ProxyLogger) -> PathBuf {
 fn guard_against_self_exec(target_path: &Path, logger: &ProxyLogger) {
     let own_path = match env::current_exe().and_then(|path| path.canonicalize()) {
         Ok(path) => path,
-        Err(error) => {
-            logger.log(
-                DIRECTION_META,
-                &format!("cannot determine own executable path: {}", error),
-            );
-            std::process::exit(2);
-        }
+        Err(error) => logger.fatal(&format!("cannot determine own executable path: {}", error)),
     };
     let canonical_target = match target_path.canonicalize() {
         Ok(path) => path,
-        Err(error) => {
-            logger.log(
-                DIRECTION_META,
-                &format!("target {} unusable: {}", target_path.display(), error),
-            );
-            std::process::exit(2);
-        }
+        Err(error) => logger.fatal(&format!(
+            "target {} unusable: {}",
+            target_path.display(),
+            error
+        )),
     };
 
     if own_path == canonical_target {
-        logger.log(
-            DIRECTION_META,
-            &format!("refusing to exec itself: {}", own_path.display()),
-        );
-        std::process::exit(2);
+        logger.fatal(&format!("refusing to exec itself: {}", own_path.display()));
     }
 }
 
@@ -461,14 +465,13 @@ fn main() {
     activate_environment_locale();
 
     let scdaemon_arguments: Vec<String> = env::args().skip(1).collect();
-    let log_path = default_log_path();
-    let logger = match ProxyLogger::new(&log_path) {
+    let log_path = configured_log_path();
+    let logger = match ProxyLogger::new(log_path.as_deref()) {
         Ok(logger) => Arc::new(logger),
         Err(error) => {
             eprintln!(
-                "scdaemon-touch-proxy: cannot open log {}: {}",
-                log_path.display(),
-                error
+                "scdaemon-touch-proxy: cannot open log {:?}: {}",
+                log_path, error
             );
             std::process::exit(2);
         }
@@ -502,13 +505,7 @@ fn main() {
         .spawn()
     {
         Ok(process) => process,
-        Err(error) => {
-            logger.log(
-                DIRECTION_META,
-                &format!("failed to spawn scdaemon: {}", error),
-            );
-            std::process::exit(2);
-        }
+        Err(error) => logger.fatal(&format!("failed to spawn scdaemon: {}", error)),
     };
 
     let scdaemon_stdin = scdaemon_process.stdin.take().expect("piped stdin missing");

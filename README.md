@@ -1,7 +1,8 @@
 # scdaemon-touch-proxy
 
 Diagnostic Assuan proxy between gpg-agent and the real scdaemon. Forwards bytes
-unchanged and logs every line with local-format timestamp, pid and ms since start.
+unchanged, shows a popup while the card waits for a touch, and can optionally log
+every line with local-format timestamp, pid and ms since start (off by default).
 
 ## Install
     mise run install      # builds release, copies to ~/.local/bin, restarts gpg-agent
@@ -20,7 +21,8 @@ macOS: `xattr -d com.apple.quarantine` on a copied prebuilt binary.
 ## Env
 
 - `SCDAEMON_TOUCH_PROXY_TARGET` real scdaemon path (default: `$(gpgconf --list-dirs libexecdir)/scdaemon`)
-- `SCDAEMON_TOUCH_PROXY_LOG` log path (macOS `~/Library/Logs/scdaemon-touch-proxy.log`, else `$XDG_STATE_HOME/scdaemon-touch-proxy/session.log`)
+- `SCDAEMON_TOUCH_PROXY_LOG` enables logging; unset/`0` = off. `1` = default path (macOS `~/Library/Logs/scdaemon-touch-proxy.log`, else `$XDG_STATE_HOME/scdaemon-touch-proxy/session.log`), any other value = log file path.
+  Must be visible to gpg-agent; restart it after changing. Fatal errors always go to stderr.
 
 ## Reading the log
 
