@@ -1,8 +1,8 @@
 use std::env;
 use std::ffi::CString;
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{create_dir_all, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -78,6 +78,9 @@ impl ProxyLogger {
             .append(true)
             .mode(0o600)
             .open(log_path)?;
+
+        // .mode() only applies on creation; narrow a pre-existing file too.
+        log_file.set_permissions(Permissions::from_mode(0o600))?;
 
         Ok(Self {
             log_file: Mutex::new(log_file),
