@@ -1,0 +1,14 @@
+[tools]
+rust = { version = "1.99.0", components = "clippy,rustfmt" }
+
+[tasks.build]
+run = "cargo build --release"
+
+[tasks.check]
+run = ["cargo fmt --check", "cargo clippy -- -D warnings"]
+
+[tasks.format]
+run = ["cargo fmt", "cargo clippy -- -D warnings"]
+
+[tasks.lint]
+run = ["cargo clippy -- -D warnings"]
