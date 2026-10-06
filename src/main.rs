@@ -4,10 +4,10 @@ use std::fs::{create_dir_all, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DIRECTION_TO_CARD: &str = ">>";
 const DIRECTION_FROM_CARD: &str = "<<";
@@ -190,6 +190,212 @@ fn guard_against_self_exec(target_path: &Path, logger: &ProxyLogger) {
     }
 }
 
+// ------------------------------------------------------------------ touch watch
+
+/// Assuan commands that make the card demand a touch (depending on the key's
+/// touch policy) once the PIN is satisfied.
+const TOUCH_COMMANDS: [&str; 3] = ["PKSIGN", "PKAUTH", "PKDECRYPT"];
+const DEFAULT_POPUP_DELAY_MS: u64 = 500;
+const POPUP_MESSAGE: &str = "Touch your YubiKey to confirm";
+
+#[derive(Default)]
+struct WatchState {
+    /// Bumped on every arm/disarm; a pending timer fires only if unchanged.
+    generation: u64,
+    /// A touch-capable command is in flight and has not got its final status.
+    operation_active: bool,
+    /// The card has an open INQUIRE; the agent's D lines are secrets (PIN).
+    inquiry_open: bool,
+    popup: Option<Child>,
+}
+
+/// scdaemon never announces "waiting for touch": the card simply stays silent.
+/// So the proxy infers it: after the command (and after any PIN inquiry has
+/// been answered) a response that takes longer than `delay` means touch wait.
+struct TouchWatch {
+    state: Mutex<WatchState>,
+    delay: Duration,
+    popup_commands: Vec<Vec<String>>,
+    logger: Arc<ProxyLogger>,
+}
+
+impl TouchWatch {
+    fn from_environment(logger: Arc<ProxyLogger>) -> Arc<Self> {
+        let delay_milliseconds = env::var("SCDAEMON_TOUCH_PROXY_POPUP_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_POPUP_DELAY_MS);
+
+        let popup_commands = match env::var("SCDAEMON_TOUCH_PROXY_POPUP") {
+            // `exec` so that killing the child really kills the dialog.
+            Ok(command) if !command.trim().is_empty() => vec![vec![
+                String::from("sh"),
+                String::from("-c"),
+                format!("exec {}", command),
+            ]],
+            _ => default_popup_commands(),
+        };
+
+        Arc::new(Self {
+            state: Mutex::new(WatchState::default()),
+            delay: Duration::from_millis(delay_milliseconds),
+            popup_commands,
+            logger,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, WatchState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Inspects one protocol line, updates the touch state machine and returns
+    /// the text that is safe to write to the log (secrets redacted).
+    fn observe(self: &Arc<Self>, direction: &str, line: &str) -> String {
+        let command = line.split(' ').next().unwrap_or("");
+
+        if direction == DIRECTION_TO_CARD {
+            match command {
+                _ if TOUCH_COMMANDS.contains(&command) => {
+                    self.lock().operation_active = true;
+                    self.arm();
+                }
+                "END" => {
+                    let operation_active = {
+                        let mut state = self.lock();
+                        state.inquiry_open = false;
+                        state.operation_active
+                    };
+                    if operation_active {
+                        self.arm();
+                    }
+                }
+                "D" if self.lock().inquiry_open => return String::from("D <redacted>"),
+                "CAN" | "RESTART" | "RESET" | "BYE" => self.reset(),
+                _ => {}
+            }
+        } else if direction == DIRECTION_FROM_CARD {
+            match command {
+                "INQUIRE" => {
+                    let operation_active = {
+                        let mut state = self.lock();
+                        state.inquiry_open = true;
+                        state.operation_active
+                    };
+                    if operation_active {
+                        // The user is typing the PIN, not touching.
+                        self.disarm();
+                    }
+                }
+                "D" | "OK" | "ERR" => {
+                    let operation_active = self.lock().operation_active;
+                    if operation_active {
+                        self.disarm();
+                        if command != "D" {
+                            self.lock().operation_active = false;
+                        }
+                    }
+                }
+                "S" if line.starts_with("S PINCACHE_PUT") => {
+                    return String::from("S PINCACHE_PUT <redacted>");
+                }
+                _ => {}
+            }
+        }
+
+        line.to_string()
+    }
+
+    fn reset(&self) {
+        {
+            let mut state = self.lock();
+            state.operation_active = false;
+            state.inquiry_open = false;
+        }
+        self.disarm();
+    }
+
+    /// Cancels any pending timer and closes a visible popup.
+    fn disarm(&self) {
+        let popup = {
+            let mut state = self.lock();
+            state.generation += 1;
+            state.popup.take()
+        };
+        if let Some(mut popup) = popup {
+            let _ = popup.kill();
+            let _ = popup.wait();
+            self.logger.log(DIRECTION_META, "touch popup closed");
+        }
+    }
+
+    /// Starts the countdown; if nothing answers within `delay`, show the popup.
+    fn arm(self: &Arc<Self>) {
+        self.disarm();
+        let expected_generation = self.lock().generation;
+        let watch = Arc::clone(self);
+        thread::spawn(move || {
+            thread::sleep(watch.delay);
+            let mut state = watch.lock();
+            if state.generation != expected_generation || state.popup.is_some() {
+                return;
+            }
+            state.popup = watch.spawn_popup();
+        });
+    }
+
+    fn spawn_popup(&self) -> Option<Child> {
+        for command in &self.popup_commands {
+            let spawned = Command::new(&command[0])
+                .args(&command[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match spawned {
+                Ok(child) => {
+                    self.logger.log(
+                        DIRECTION_META,
+                        &format!("touch popup shown via {}", command[0]),
+                    );
+                    return Some(child);
+                }
+                Err(error) => self.logger.log(
+                    DIRECTION_META,
+                    &format!("popup command {} failed: {}", command[0], error),
+                ),
+            }
+        }
+        None
+    }
+}
+
+fn default_popup_commands() -> Vec<Vec<String>> {
+    let command = |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
+
+    if cfg!(target_os = "macos") {
+        vec![command(&[
+            "osascript",
+            "-e",
+            &format!(
+                "display dialog \"{}\" with title \"GPG signature\" buttons {{\"Dismiss\"}} default button 1 giving up after 120",
+                POPUP_MESSAGE
+            ),
+        ])]
+    } else {
+        vec![
+            command(&["kdialog", "--title", "GPG signature", "--msgbox", POPUP_MESSAGE]),
+            command(&[
+                "zenity",
+                "--info",
+                "--title=GPG signature",
+                &format!("--text={}", POPUP_MESSAGE),
+                "--timeout=120",
+            ]),
+            command(&["notify-send", "-u", "critical", "GPG signature", POPUP_MESSAGE]),
+        ]
+    }
+}
+
 // ------------------------------------------------------------------- forwarding
 
 /// Copies bytes through immediately and only then reassembles them into lines
@@ -200,6 +406,7 @@ fn forward_and_log(
     mut sink: impl Write,
     direction: &'static str,
     logger: Arc<ProxyLogger>,
+    watch: Arc<TouchWatch>,
 ) {
     let mut read_buffer = [0u8; 4096];
     let mut pending_line: Vec<u8> = Vec::new();
@@ -229,7 +436,9 @@ fn forward_and_log(
 
         for &byte in chunk {
             if byte == b'\n' {
-                logger.log(direction, &String::from_utf8_lossy(&pending_line));
+                let line = String::from_utf8_lossy(&pending_line);
+                let logged_line = watch.observe(direction, &line);
+                logger.log(direction, &logged_line);
                 pending_line.clear();
             } else {
                 pending_line.push(byte);
@@ -308,23 +517,29 @@ fn main() {
         .take()
         .expect("piped stdout missing");
 
+    let touch_watch = TouchWatch::from_environment(Arc::clone(&logger));
+
     let agent_to_card_logger = Arc::clone(&logger);
+    let agent_to_card_watch = Arc::clone(&touch_watch);
     thread::spawn(move || {
         forward_and_log(
             std::io::stdin(),
             scdaemon_stdin,
             DIRECTION_TO_CARD,
             agent_to_card_logger,
+            agent_to_card_watch,
         )
     });
 
     let card_to_agent_logger = Arc::clone(&logger);
+    let card_to_agent_watch = Arc::clone(&touch_watch);
     let card_to_agent_thread = thread::spawn(move || {
         forward_and_log(
             scdaemon_stdout,
             std::io::stdout(),
             DIRECTION_FROM_CARD,
             card_to_agent_logger,
+            card_to_agent_watch,
         )
     });
 
@@ -332,6 +547,7 @@ fn main() {
         .wait()
         .expect("failed to wait for scdaemon");
     let _ = card_to_agent_thread.join();
+    touch_watch.reset();
 
     logger.log(
         DIRECTION_META,

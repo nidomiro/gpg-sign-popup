@@ -12,3 +12,11 @@ run = ["cargo fmt", "cargo clippy -- -D warnings"]
 
 [tasks.lint]
 run = ["cargo clippy -- -D warnings"]
+
+[tasks.install]
+description = "Install the release binary to ~/.local/bin and restart gpg-agent (does not touch gpg-agent.conf)"
+depends = ["build"]
+run = [
+  "install -m 755 target/release/scdaemon-touch-proxy ~/.local/bin/scdaemon-touch-proxy",
+  "gpgconf --kill gpg-agent",
+]
