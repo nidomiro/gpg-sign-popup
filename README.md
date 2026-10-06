@@ -4,12 +4,16 @@ Diagnostic Assuan proxy between gpg-agent and the real scdaemon. Forwards bytes
 unchanged and logs every line with local-format timestamp, pid and ms since start.
 
 ## Install
+    mise run install      # builds release, copies to ~/.local/bin, restarts gpg-agent
 
-    cargo build --release
-    install -m 755 target/release/scdaemon-touch-proxy ~/.local/bin/
+Configure gpg-agent once (the task never touches this file):
+
     echo "scdaemon-program $HOME/.local/bin/scdaemon-touch-proxy" >> ~/.gnupg/gpg-agent.conf
-    gpgconf --kill gpg-agent
     gpg --card-status
+
+gpg-agent keeps running the old proxy until restarted; `mise run install` does that
+via `gpgconf --kill gpg-agent`. Manual equivalent: `cargo build --release`,
+`install -m 755 target/release/scdaemon-touch-proxy ~/.local/bin/`, `gpgconf --kill gpg-agent`.
 
 macOS: `xattr -d com.apple.quarantine` on a copied prebuilt binary.
 
