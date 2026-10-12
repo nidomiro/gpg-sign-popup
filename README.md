@@ -38,7 +38,7 @@ no `D`/`OK`/`ERR` within the delay ⇒ popup. It closes on the response.
 
 - `SCDAEMON_TOUCH_PROXY_POPUP_DELAY_MS` (default 500)
 - `SCDAEMON_TOUCH_PROXY_POPUP` shell command to run as the popup (killed to dismiss).
-  Defaults: macOS `osascript` dialog; Linux `kdialog`, `zenity`, `notify-send` (first that starts).
+  Defaults: macOS `osascript` dialog with `/System/Library/Sounds/Glass.aiff`; Linux `kdialog`, `zenity`, `notify-send` (first that starts).
 
 Env vars must be visible to gpg-agent (`gpgconf --kill gpg-agent` after changing them).
 

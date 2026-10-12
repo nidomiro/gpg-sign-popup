@@ -249,7 +249,9 @@ impl TouchWatch {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, WatchState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Inspects one protocol line, updates the touch state machine and returns
@@ -374,20 +376,27 @@ impl TouchWatch {
 }
 
 fn default_popup_commands() -> Vec<Vec<String>> {
-    let command = |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
+    let command =
+        |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
 
     if cfg!(target_os = "macos") {
         vec![command(&[
             "osascript",
             "-e",
             &format!(
-                "display dialog \"{}\" with title \"GPG signature\" buttons {{\"Dismiss\"}} default button 1 giving up after 120",
+                "do shell script \"afplay /System/Library/Sounds/Glass.aiff >/dev/null 2>&1 &\"\ndisplay dialog \"{}\" with title \"GPG signature\" buttons {{\"Dismiss\"}} default button 1 giving up after 120",
                 POPUP_MESSAGE
             ),
         ])]
     } else {
         vec![
-            command(&["kdialog", "--title", "GPG signature", "--msgbox", POPUP_MESSAGE]),
+            command(&[
+                "kdialog",
+                "--title",
+                "GPG signature",
+                "--msgbox",
+                POPUP_MESSAGE,
+            ]),
             command(&[
                 "zenity",
                 "--info",
@@ -395,7 +404,13 @@ fn default_popup_commands() -> Vec<Vec<String>> {
                 &format!("--text={}", POPUP_MESSAGE),
                 "--timeout=120",
             ]),
-            command(&["notify-send", "-u", "critical", "GPG signature", POPUP_MESSAGE]),
+            command(&[
+                "notify-send",
+                "-u",
+                "critical",
+                "GPG signature",
+                POPUP_MESSAGE,
+            ]),
         ]
     }
 }
@@ -551,4 +566,21 @@ fn main() {
         &format!("scdaemon exited with {:?}", exit_status.code()),
     );
     std::process::exit(exit_status.code().unwrap_or(1));
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_popup_script_plays_glass_sound() {
+        let commands = default_popup_commands();
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0][0], "osascript");
+        assert_eq!(commands[0][1], "-e");
+        assert!(commands[0][2]
+            .starts_with("do shell script \"afplay /System/Library/Sounds/Glass.aiff"));
+        assert!(commands[0][2].contains("display dialog"));
+    }
 }
